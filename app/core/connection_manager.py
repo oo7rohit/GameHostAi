@@ -46,4 +46,12 @@ class ConnectionManager:
         except Exception as e:
             logger.error(f"Error sending personal message: {e}")
 
+    def get_speaker_socket(self, room_id: str) -> WebSocket | None:
+        """Return the WebSocket for the player flagged as speaker, or None."""
+        room_conns = self.active_rooms.get(room_id, {})
+        for player_id, conn_data in room_conns.items():
+            if conn_data.get("is_speaker"):
+                return conn_data["socket"]
+        return None
+
 manager = ConnectionManager()

@@ -7,12 +7,16 @@ All game-specific logic is delegated to an injected ``BaseGameStrategy``.
 import asyncio
 import logging
 from enum import Enum
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from app.core.connection_manager import ConnectionManager
 from app.core.redis import save_game_state, load_game_state
 from app.engine.strategy import BaseGameStrategy
 from app.schemas.messages import ServerEvent
+from app.schemas.narration import NarrationRequest
+
+if TYPE_CHECKING:
+    from app.core.rabbitmq import RabbitMQClient
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +51,18 @@ class GameStateMachine:
         room_id: str,
         strategy: BaseGameStrategy,
         conn_mgr: ConnectionManager,
+        rabbitmq_publisher: "RabbitMQClient | None" = None,
     ) -> None:
         self.room_id = room_id
         self.strategy = strategy
         self.conn_mgr = conn_mgr
+        self.rabbitmq_publisher = rabbitmq_publisher
 
         self.game_phase: GamePhase = GamePhase.LOBBY
         self.game_state: dict[str, Any] = {}
+
+        # Narration sequence tracking
+        self.turn_number: int = 0
 
         # Action queuing — dict for idempotency (player can update action)
         self.current_phase_actions: dict[str, dict[str, Any]] = {}
@@ -94,6 +103,9 @@ class GameStateMachine:
                 data={"role": pdata["role"]},
             )
             await self._send_to_player(player_id, role_event)
+
+        # Publish game_start narration request
+        self._publish_narration("game_start", {"players": list(self.game_state["players"].keys())})
 
         # Start the phase timer
         self._start_phase_timer()
@@ -158,6 +170,9 @@ class GameStateMachine:
             current_phase = self.game_state.get("phase", "unknown")
             logger.info("Room %s: resolving phase '%s'", self.room_id, current_phase)
 
+            # Increment turn counter
+            self.turn_number += 1
+
             # Delegate to the strategy
             new_state, private_messages = self.strategy.evaluate_phase(
                 self.game_state,
@@ -190,6 +205,9 @@ class GameStateMachine:
                 )
                 await self._send_to_player(player_id, pm_event)
 
+            # Fire-and-forget narration request based on resolved phase
+            self._publish_narration_for_phase(current_phase)
+
             # Check win condition
             winner = self.strategy.check_win_condition(self.game_state)
             if winner:
@@ -203,6 +221,7 @@ class GameStateMachine:
                     },
                 )
                 await self.conn_mgr.broadcast_to_room(self.room_id, win_event)
+                self._publish_narration("game_over", {"winner": winner})
                 logger.info("Room %s: game over — %s wins!", self.room_id, winner)
             else:
                 # Reset actions and start the next phase timer
@@ -251,6 +270,44 @@ class GameStateMachine:
             await self.conn_mgr.send_personal_message(event, conn_data["socket"])
         else:
             logger.debug("Room %s: player %s not connected, skipping message.", self.room_id, player_id)
+
+    # ------------------------------------------------------------------ #
+    # Narration helpers
+    # ------------------------------------------------------------------ #
+    def _publish_narration(self, event_context: str, context_data: dict[str, Any]) -> None:
+        """Fire-and-forget a NarrationRequest to RabbitMQ."""
+        if self.rabbitmq_publisher is None:
+            return
+
+        request = NarrationRequest(
+            room_id=self.room_id,
+            event_context=event_context,
+            context_data=context_data,
+            turn_number=self.turn_number,
+        )
+        asyncio.create_task(self.rabbitmq_publisher.publish_narration_request(request))
+
+    def _publish_narration_for_phase(self, resolved_phase: str) -> None:
+        """Build the appropriate narration context from the last resolution."""
+        if resolved_phase == "NIGHT_ACTIONS":
+            night_result = self.game_state.get("last_night_result", {})
+            killed = night_result.get("killed")
+            if killed:
+                self._publish_narration("night_kill", {"killed": killed})
+            else:
+                self._publish_narration("night_save", {})
+        elif resolved_phase == "DAY_VOTING":
+            day_result = self.game_state.get("last_day_result", {})
+            eliminated = day_result.get("eliminated")
+            if eliminated:
+                self._publish_narration("day_vote", {
+                    "eliminated": eliminated,
+                    "vote_counts": day_result.get("vote_counts", {}),
+                })
+            else:
+                self._publish_narration("day_no_elimination", {
+                    "vote_counts": day_result.get("vote_counts", {}),
+                })
 
 
 # ---------------------------------------------------------------------------
