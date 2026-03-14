@@ -1,38 +1,114 @@
 import json
 import logging
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
+from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
 from app.core.connection_manager import manager
 from app.core.rabbitmq import rabbitmq_client
-from app.core.redis import set_player_online, set_player_offline, get_room_state
+from app.core.redis import (
+    get_room_meta,
+    get_room_state,
+    set_player_offline,
+    set_player_online,
+    set_room_meta,
+)
 from app.engine.games.mafia import MafiaStrategy
 from app.engine.state_machine import GameStateMachine, active_games
 from app.schemas.messages import ClientAction, ServerEvent
 from app.schemas.narration import NarrationResponse
+from app.schemas.session import GameName, PlayerSession, RoomInfo
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
 
+async def _build_room_payload(room: RoomInfo) -> dict:
+    """Build a room snapshot payload suitable for UI consumption."""
+    room_state = await get_room_state(room.id)
+    players: list[dict] = []
+    for player_id, meta in room_state.items():
+        if isinstance(meta, dict):
+            players.append(
+                {
+                    "player_id": player_id,
+                    "player_name": meta.get("player_name") or player_id,
+                    "is_speaker": bool(meta.get("is_speaker", False)),
+                }
+            )
+        else:
+            players.append({"player_id": player_id, "player_name": player_id, "is_speaker": False})
+
+    return {
+        "id": room.id,
+        "game_name": room.game_name.value,
+        "players": players,
+    }
+
+
+def _room_from_request(
+    room_id: str,
+    game_name: GameName = Query(..., description="Game to play in this room"),
+) -> RoomInfo:
+    return RoomInfo(id=room_id, game_name=game_name)
+
+
+def _player_session_from_request(
+    player_id: str,
+    player_name: str = Query(..., min_length=1, description="Human-readable player name"),
+    is_speaker: bool = Query(False, description="Flag indicating if the player is the speaker"),
+) -> PlayerSession:
+    return PlayerSession(player_id=player_id, player_name=player_name, is_speaker=is_speaker)
+
+
 @router.websocket("/ws/{room_id}/{player_id}")
 async def websocket_endpoint(
     websocket: WebSocket,
-    room_id: str,
-    player_id: str,
-    is_speaker: bool = Query(False, description="Flag indicating if the player is the speaker"),
+    room: RoomInfo = Depends(_room_from_request),
+    player: PlayerSession = Depends(_player_session_from_request),
 ) -> None:
-    await manager.connect(websocket, room_id, player_id, is_speaker)
-    await set_player_online(room_id, player_id, is_speaker)
+    registered = False
 
-    join_event = ServerEvent(
-        event_type="system_event",
-        data={"message": f"Player {player_id} joined room {room_id}"},
-    )
-    await manager.broadcast_to_room(room_id, join_event)
+    persisted_room = await get_room_meta(room.id)
+    if persisted_room is None:
+        await set_room_meta(room)
+    elif persisted_room.game_name != room.game_name:
+        # Accept then immediately close with a policy violation; don't register this socket.
+        await websocket.accept()
+        await websocket.send_text(
+            ServerEvent(
+                event_type="error",
+                data={
+                    "message": (
+                        f"Room {room.id} is configured for game {persisted_room.game_name.value}; "
+                        f"cannot join with game {room.game_name.value}."
+                    ),
+                },
+            ).model_dump_json()
+        )
+        await websocket.close(code=1008)
+        return
 
     try:
+        await manager.connect(websocket, room.id, player)
+        registered = True
+        await set_player_online(room.id, player)
+
+        room_payload = await _build_room_payload(room)
+        join_event = ServerEvent(
+            event_type="system_event",
+            data={
+                "message": f"Player {player.player_name} joined.",
+                "room": room_payload,
+                "player": player.model_dump(),
+            },
+        )
+        await manager.broadcast_to_room(room.id, join_event)
+
         while True:
-            data = await websocket.receive_text()
+            try:
+                data = await websocket.receive_text()
+            except (WebSocketDisconnect, RuntimeError):
+                # Starlette can raise RuntimeError if the socket is already closed.
+                break
 
             try:
                 msg_data = json.loads(data)
@@ -40,12 +116,12 @@ async def websocket_endpoint(
 
                 # ----- Game engine integration -------------------------
                 if client_action.action_type == "start_game":
-                    await _handle_start_game(room_id)
+                    await _handle_start_game(room)
 
-                elif room_id in active_games:
+                elif room.id in active_games:
                     # Forward action to the running state machine
-                    state_machine = active_games[room_id]
-                    await state_machine.queue_action(player_id, client_action.payload)
+                    state_machine = active_games[room.id]
+                    await state_machine.queue_action(player.player_id, client_action.payload)
 
                 else:
                     # No active game — echo back for now
@@ -59,31 +135,47 @@ async def websocket_endpoint(
                     await manager.send_personal_message(response, websocket)
 
             except Exception as e:
-                logger.error(f"Failed to process message from {player_id}: {e}")
+                logger.error(f"Failed to process message from {player.player_id}: {e}")
                 err_response = ServerEvent(
                     event_type="error",
                     data={"message": "Invalid payload format."},
                 )
                 await manager.send_personal_message(err_response, websocket)
-
-    except WebSocketDisconnect:
-        manager.disconnect(room_id, player_id)
-        await set_player_offline(room_id, player_id)
+    except Exception:
+        logger.exception("Unhandled websocket error for room %s player %s", room.id, player.player_id)
+    finally:
+        if not registered:
+            return
+        manager.disconnect(room.id, player.player_id)
+        room_payload: dict | None = None
+        try:
+            await set_player_offline(room.id, player.player_id)
+        except Exception:
+            logger.exception("Failed to mark player offline for room %s player %s", room.id, player.player_id)
+        try:
+            room_payload = await _build_room_payload(room)
+        except Exception:
+            logger.exception("Failed to build room payload for disconnect broadcast in room %s", room.id)
 
         disconnect_event = ServerEvent(
             event_type="system_event",
-            data={"message": f"Player {player_id} disconnected from room {room_id}"},
+            data={
+                "message": f"Player {player.player_name} left.",
+                "room": room_payload or {"id": room.id, "game_name": room.game_name.value, "players": []},
+                "player": player.model_dump(),
+            },
         )
-        await manager.broadcast_to_room(room_id, disconnect_event)
-        logger.info(f"Client {player_id} disconnected")
+        await manager.broadcast_to_room(room.id, disconnect_event)
+        logger.info("Client %s disconnected", player.player_id)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-async def _handle_start_game(room_id: str) -> None:
+async def _handle_start_game(room: RoomInfo) -> None:
     """Create a GameStateMachine for the room and start the game."""
+    room_id = room.id
     if room_id in active_games:
         logger.warning("start_game ignored — game already running in room %s", room_id)
         err = ServerEvent(
@@ -105,8 +197,17 @@ async def _handle_start_game(room_id: str) -> None:
         await manager.broadcast_to_room(room_id, err)
         return
 
-    # Create the state machine with the Mafia strategy
-    strategy = MafiaStrategy()
+    # Strategy selection based on the room's configured game.
+    if room.game_name == GameName.MAFIA:
+        strategy = MafiaStrategy()
+    else:
+        err = ServerEvent(
+            event_type="error",
+            data={"message": f"Unsupported game: {room.game_name.value}"},
+        )
+        await manager.broadcast_to_room(room_id, err)
+        return
+
     state_machine = GameStateMachine(
         room_id=room_id,
         strategy=strategy,

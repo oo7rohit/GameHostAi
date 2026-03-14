@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.engine.games.mafia import MafiaStrategy, PHASE_NIGHT, PHASE_DAY, ROLE_MAFIA, ROLE_VILLAGER
 from app.engine.state_machine import GameStateMachine, GamePhase
+from app.schemas.session import PlayerSession
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +75,10 @@ class TestGameLifecycle:
         mock_sockets = {}
         for pid in players:
             mock_ws = MagicMock()
-            mock_sockets[pid] = {"socket": mock_ws, "is_speaker": False}
+            mock_sockets[pid] = {
+                "socket": mock_ws,
+                "player": PlayerSession(player_id=pid, player_name=pid, is_speaker=False),
+            }
         mock_conn_mgr.active_rooms = {"test-room": mock_sockets}
 
         await state_machine.start_game(players)

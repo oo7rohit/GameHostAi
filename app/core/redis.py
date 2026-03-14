@@ -3,6 +3,7 @@ import logging
 from typing import Dict, Any
 import redis.asyncio as redis
 from app.core.config import settings
+from app.schemas.session import GameName, PlayerSession, RoomInfo
 
 logger = logging.getLogger(__name__)
 
@@ -15,15 +16,15 @@ async def check_redis_connection() -> bool:
     except Exception:
         return False
 
-async def set_player_online(room_id: str, player_id: str, is_speaker: bool = False):
+async def set_player_online(
+    room_id: str,
+    player: PlayerSession,
+):
     """Stores the player state as a JSON string in a Redis Hash linked to the Room ID."""
-    state = {
-        "status": "online",
-        "is_speaker": is_speaker
-    }
+    state = {"status": "online"} | player.model_dump(mode="json", exclude_none=True)
     hash_key = f"room:{room_id}:players"
-    await redis_client.hset(hash_key, player_id, json.dumps(state))
-    logger.info(f"Stored player {player_id} state in Redis for room {room_id}")
+    await redis_client.hset(hash_key, player.player_id, json.dumps(state))
+    logger.info(f"Stored player {player.player_id} state in Redis for room {room_id}")
 
 async def set_player_offline(room_id: str, player_id: str):
     """Updates the player state to offline in Redis without removing them from the Room."""
@@ -55,6 +56,51 @@ async def get_room_state(room_id: str) -> Dict[str, Any]:
             room_state[player_id] = state_json
             
     return room_state
+
+
+# ---------------------------------------------------------------------------
+# Room metadata
+# ---------------------------------------------------------------------------
+
+async def set_room_meta(room: RoomInfo) -> None:
+    """Persist room metadata used to keep room configuration stable across reconnects."""
+    key = f"room:{room.id}:meta"
+    await redis_client.set(key, room.model_dump_json(exclude_none=True))
+
+
+async def get_room_meta(room_id: str) -> RoomInfo | None:
+    """Return persisted room metadata, if any.
+
+    Backwards-compatible with older stored shapes like ``{"game_name": "Mafia"}``.
+    """
+    key = f"room:{room_id}:meta"
+    raw = await redis_client.get(key)
+    if raw is None:
+        return None
+    assert isinstance(raw, str)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Corrupted room meta in Redis for room %s", room_id)
+        return None
+    try:
+        if isinstance(parsed, dict) and "id" not in parsed:
+            parsed = {"id": room_id, **parsed}
+        return RoomInfo.model_validate(parsed)
+    except Exception:
+        logger.warning("Invalid room meta in Redis for room %s", room_id)
+        return None
+
+
+async def set_room_game_name(room_id: str, game_name: GameName) -> None:
+    """Convenience wrapper for setting the room's game selection."""
+    await set_room_meta(RoomInfo(id=room_id, game_name=game_name))
+
+
+async def get_room_game_name(room_id: str) -> GameName | None:
+    """Convenience wrapper for retrieving the room's game selection."""
+    meta = await get_room_meta(room_id)
+    return None if meta is None else meta.game_name
 
 
 # ---------------------------------------------------------------------------

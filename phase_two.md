@@ -23,7 +23,7 @@ WebSockets are fragile; players will drop connection on mobile networks. The "Tr
 * If a WebSocket disconnects, the player remains in the Redis `Room_ID` state. They are simply marked as "offline."
 
 ## 4. The WebSocket Router
-Create the FastAPI router endpoint (`/ws/{room_id}/{player_id}`).
+Create the FastAPI router endpoint (`/ws/{room_id}/{player_id}`) and accept additional room/player metadata via query params (e.g., `game_name`, `player_name`).
 * On connection, validate the room in Redis, accept the socket, and broadcast a join event.
 * Set up the async receive loop: parse incoming text, validate it against the `ClientAction` schema, and (for now) just echo back an acknowledgment using the `ServerEvent` schema.
 * Handle `WebSocketDisconnect` gracefully without crashing the server thread.
