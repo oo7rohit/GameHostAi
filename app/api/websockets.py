@@ -2,10 +2,12 @@ import json
 import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from app.core.connection_manager import manager
+from app.core.rabbitmq import rabbitmq_client
 from app.core.redis import set_player_online, set_player_offline, get_room_state
 from app.engine.games.mafia import MafiaStrategy
 from app.engine.state_machine import GameStateMachine, active_games
 from app.schemas.messages import ClientAction, ServerEvent
+from app.schemas.narration import NarrationResponse
 
 logger = logging.getLogger(__name__)
 
@@ -109,8 +111,61 @@ async def _handle_start_game(room_id: str) -> None:
         room_id=room_id,
         strategy=strategy,
         conn_mgr=manager,
+        rabbitmq_publisher=rabbitmq_client,
     )
     active_games[room_id] = state_machine
 
     await state_machine.start_game(player_ids)
     logger.info("GameStateMachine created and game started for room %s", room_id)
+
+
+# ---------------------------------------------------------------------------
+# Narration response handler (called by the RabbitMQ consumer)
+# ---------------------------------------------------------------------------
+
+async def handle_narration_response(response: NarrationResponse) -> None:
+    """Process a NarrationResponse consumed from RabbitMQ.
+
+    1. Verify that the room's current turn_number matches the response
+       to prevent stale narration from reaching the wrong phase.
+    2. Broadcast narration_text to ALL players in the room.
+    3. Send an AUDIO_TRIGGER event ONLY to the speaker connection.
+    """
+    room_id = response.room_id
+
+    # --- Staleness check ---------------------------------------------------
+    state_machine = active_games.get(room_id)
+    if state_machine is None:
+        logger.warning("Narration response for unknown room %s — discarding.", room_id)
+        return
+
+    if state_machine.turn_number != response.turn_number:
+        logger.warning(
+            "Stale narration for room %s: response turn %d != current turn %d — discarding.",
+            room_id,
+            response.turn_number,
+            state_machine.turn_number,
+        )
+        return
+
+    # --- Broadcast narration text to all players ---------------------------
+    narration_event = ServerEvent(
+        event_type="narration",
+        phase=state_machine.game_state.get("phase"),
+        data={"narration_text": response.narration_text},
+    )
+    await manager.broadcast_to_room(room_id, narration_event)
+
+    # --- AUDIO_TRIGGER to speaker only ------------------------------------
+    if response.audio_url:
+        speaker_socket = manager.get_speaker_socket(room_id)
+        if speaker_socket is not None:
+            audio_event = ServerEvent(
+                event_type="AUDIO_TRIGGER",
+                phase=state_machine.game_state.get("phase"),
+                data={"audio_url": response.audio_url},
+            )
+            await manager.send_personal_message(audio_event, speaker_socket)
+            logger.info("AUDIO_TRIGGER sent to speaker in room %s.", room_id)
+        else:
+            logger.debug("No speaker connected in room %s — skipping AUDIO_TRIGGER.", room_id)
