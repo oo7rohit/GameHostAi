@@ -1,5 +1,6 @@
 import logging
 from typing import Dict
+from uuid import uuid4
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
 from app.schemas.messages import ServerEvent
@@ -9,18 +10,32 @@ logger = logging.getLogger(__name__)
 
 class ConnectionManager:
     def __init__(self):
-        # Dict[room_id, Dict[player_id, {"socket": WebSocket, "player": PlayerSession}]]
+        # Dict[room_id, Dict[player_id, {"socket": WebSocket, "player": PlayerSession, "conn_id": str}]]
         self.active_rooms: Dict[str, Dict[str, dict]] = {}
 
-    async def connect(self, websocket: WebSocket, room_id: str, player: PlayerSession):
-        await websocket.accept()
-        
+    async def connect(self, websocket: WebSocket, room_id: str, player: PlayerSession) -> str:
+        conn_id = uuid4().hex
+
         if room_id not in self.active_rooms:
             self.active_rooms[room_id] = {}
-            
+
+        # If a previous connection exists for this player, best-effort close it.
+        # In React 18 StrictMode, the client often already closed it, so we must
+        # swallow close errors to avoid breaking the new connection.
+        existing = self.active_rooms[room_id].get(player.player_id)
+        if existing is not None:
+            old_socket: WebSocket = existing["socket"]
+            try:
+                await old_socket.close(code=4001, reason="Replaced by newer connection")
+            except Exception:
+                pass
+
+        await websocket.accept()
+
         self.active_rooms[room_id][player.player_id] = {
             "socket": websocket,
             "player": player,
+            "conn_id": conn_id,
         }
         logger.info(
             "Player %s connected to room %s (speaker: %s)",
@@ -28,14 +43,30 @@ class ConnectionManager:
             room_id,
             player.is_speaker,
         )
+        return conn_id
 
-    def disconnect(self, room_id: str, player_id: str):
-        if room_id in self.active_rooms:
-            if player_id in self.active_rooms[room_id]:
-                del self.active_rooms[room_id][player_id]
-                logger.info(f"Player {player_id} disconnected from room {room_id}")
-            if not self.active_rooms[room_id]:
-                del self.active_rooms[room_id]
+    def disconnect(self, room_id: str, player_id: str, conn_id: str | None = None) -> bool:
+        """Remove a connection.
+
+        If conn_id is provided, removal only happens if it matches the stored conn_id.
+        This prevents stale cleanup (StrictMode double-mount) from deleting a newer connection.
+        """
+        room_conns = self.active_rooms.get(room_id)
+        if not room_conns:
+            return False
+
+        existing = room_conns.get(player_id)
+        if existing is None:
+            return False
+
+        if conn_id is not None and existing.get("conn_id") != conn_id:
+            return False
+
+        del room_conns[player_id]
+        logger.info("Player %s disconnected from room %s", player_id, room_id)
+        if not room_conns:
+            del self.active_rooms[room_id]
+        return True
 
     async def broadcast_to_room(self, room_id: str, message: ServerEvent):
         if room_id in self.active_rooms:
@@ -48,10 +79,10 @@ class ConnectionManager:
                 except WebSocketDisconnect:
                     # Expected during fast refresh / React StrictMode / tab close.
                     logger.info("Broadcast prune: %s disconnected from %s", player_id, room_id)
-                    self.disconnect(room_id, player_id)
+                    self.disconnect(room_id, player_id, conn_id=None)
                 except Exception as e:
                     logger.error("Error broadcasting to %s in %s: %r", player_id, room_id, e)
-                    self.disconnect(room_id, player_id)
+                    self.disconnect(room_id, player_id, conn_id=None)
 
     async def send_personal_message(self, message: ServerEvent, websocket: WebSocket):
         try:

@@ -14,12 +14,13 @@ async def test_connection_manager_stores_player_session() -> None:
     ws.accept = AsyncMock()
 
     player = PlayerSession(player_id="p1", player_name="Alice", is_speaker=False, level=3)
-    await mgr.connect(ws, "room-1", player)
+    conn_id = await mgr.connect(ws, "room-1", player)
 
     assert "room-1" in mgr.active_rooms
     assert "p1" in mgr.active_rooms["room-1"]
     assert mgr.active_rooms["room-1"]["p1"]["socket"] is ws
     assert mgr.active_rooms["room-1"]["p1"]["player"] == player
+    assert mgr.active_rooms["room-1"]["p1"]["conn_id"] == conn_id
 
 
 def test_get_speaker_socket_uses_player_session() -> None:
@@ -52,4 +53,41 @@ async def test_broadcast_prunes_disconnected_socket() -> None:
 
     # Should not raise; should prune the dead connection.
     await mgr.broadcast_to_room("room-1", MagicMock(model_dump_json=lambda: "{}"))
+    assert "room-1" not in mgr.active_rooms
+
+
+@pytest.mark.asyncio
+async def test_connect_replaces_existing_and_swallows_close_errors() -> None:
+    mgr = ConnectionManager()
+
+    old_ws = MagicMock()
+    old_ws.accept = AsyncMock()
+    old_ws.close = AsyncMock(side_effect=RuntimeError("already closed"))
+
+    new_ws = MagicMock()
+    new_ws.accept = AsyncMock()
+
+    player = PlayerSession(player_id="p1", player_name="Alice", is_speaker=False)
+
+    old_conn_id = await mgr.connect(old_ws, "room-1", player)
+    new_conn_id = await mgr.connect(new_ws, "room-1", player)
+
+    assert old_conn_id != new_conn_id
+    assert mgr.active_rooms["room-1"]["p1"]["socket"] is new_ws
+
+
+def test_disconnect_is_conditional_on_conn_id() -> None:
+    mgr = ConnectionManager()
+    ws = MagicMock()
+
+    mgr.active_rooms = {
+        "room-1": {
+            "p1": {"socket": ws, "player": PlayerSession(player_id="p1", player_name="Alice", is_speaker=False), "conn_id": "new"},
+        }
+    }
+
+    assert mgr.disconnect("room-1", "p1", conn_id="old") is False
+    assert "p1" in mgr.active_rooms["room-1"]
+
+    assert mgr.disconnect("room-1", "p1", conn_id="new") is True
     assert "room-1" not in mgr.active_rooms

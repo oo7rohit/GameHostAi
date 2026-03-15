@@ -19,7 +19,7 @@ async def test_set_player_online_persists_all_player_fields() -> None:
     )
 
     with patch.object(redis_mod, "redis_client", fake_client):
-        await redis_mod.set_player_online("room-1", player)
+        await redis_mod.set_player_online("room-1", player, conn_id="c1")
 
     fake_client.hset.assert_awaited_once()
     hash_key, field, raw_state = fake_client.hset.await_args.args
@@ -28,6 +28,7 @@ async def test_set_player_online_persists_all_player_fields() -> None:
 
     state = json.loads(raw_state)
     assert state["status"] == "online"
+    assert state["conn_id"] == "c1"
     assert state["player_id"] == "p1"
     assert state["player_name"] == "Alice"
     assert state["is_speaker"] is True
@@ -63,3 +64,36 @@ async def test_get_room_meta_backwards_compatible_legacy_shape() -> None:
     assert meta.id == "room-legacy"
     assert meta.game_name == GameName.MAFIA
 
+
+@pytest.mark.asyncio
+async def test_set_player_offline_guard_skips_when_conn_id_mismatch() -> None:
+    fake_client = AsyncMock()
+    fake_client.hget = AsyncMock(
+        return_value=json.dumps(
+            {"status": "online", "conn_id": "new", "player_name": "Alice", "is_speaker": False}
+        )
+    )
+
+    with patch.object(redis_mod, "redis_client", fake_client):
+        await redis_mod.set_player_offline("room-1", "p1", conn_id="old")
+
+    fake_client.hset.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_set_player_offline_guard_allows_when_conn_id_matches() -> None:
+    fake_client = AsyncMock()
+    fake_client.hget = AsyncMock(
+        return_value=json.dumps(
+            {"status": "online", "conn_id": "c1", "player_name": "Alice", "is_speaker": False}
+        )
+    )
+
+    with patch.object(redis_mod, "redis_client", fake_client):
+        await redis_mod.set_player_offline("room-1", "p1", conn_id="c1")
+
+    fake_client.hset.assert_awaited_once()
+    _, _, raw_state = fake_client.hset.await_args.args
+    state = json.loads(raw_state)
+    assert state["status"] == "offline"
+    assert state["conn_id"] == "c1"

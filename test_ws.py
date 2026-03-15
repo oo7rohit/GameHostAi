@@ -1,7 +1,10 @@
 import asyncio
 import websockets
 
-async def test_ws(uri):
+__test__ = False  # pytest collection guard; this file is a manual smoke script.
+
+
+async def smoke_ws(uri: str) -> None:
     try:
         async with websockets.connect(uri) as websocket:
             print(f"Connected to {uri}")
@@ -11,7 +14,7 @@ async def test_ws(uri):
 
 async def main():
     print("Testing /ws/room1/player1 ...")
-    await test_ws("ws://localhost:8000/ws/room1/player1?game_name=Mafia&player_name=Player1&is_speaker=false")
+    await smoke_ws("ws://localhost:8000/ws/room1/player1?game_name=Mafia&player_name=Player1&is_speaker=false")
 
 if __name__ == "__main__":
     asyncio.run(main())

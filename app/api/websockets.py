@@ -66,6 +66,7 @@ async def websocket_endpoint(
     player: PlayerSession = Depends(_player_session_from_request),
 ) -> None:
     registered = False
+    conn_id: str | None = None
 
     persisted_room = await get_room_meta(room.id)
     if persisted_room is None:
@@ -88,9 +89,9 @@ async def websocket_endpoint(
         return
 
     try:
-        await manager.connect(websocket, room.id, player)
+        conn_id = await manager.connect(websocket, room.id, player)
         registered = True
-        await set_player_online(room.id, player)
+        await set_player_online(room.id, player, conn_id)
 
         room_payload = await _build_room_payload(room)
         join_event = ServerEvent(
@@ -144,12 +145,14 @@ async def websocket_endpoint(
     except Exception:
         logger.exception("Unhandled websocket error for room %s player %s", room.id, player.player_id)
     finally:
-        if not registered:
+        if not registered or conn_id is None:
             return
-        manager.disconnect(room.id, player.player_id)
+        removed = manager.disconnect(room.id, player.player_id, conn_id)
+        if not removed:
+            return
         room_payload: dict | None = None
         try:
-            await set_player_offline(room.id, player.player_id)
+            await set_player_offline(room.id, player.player_id, conn_id)
         except Exception:
             logger.exception("Failed to mark player offline for room %s player %s", room.id, player.player_id)
         try:

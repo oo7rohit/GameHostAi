@@ -19,14 +19,15 @@ async def check_redis_connection() -> bool:
 async def set_player_online(
     room_id: str,
     player: PlayerSession,
+    conn_id: str,
 ):
     """Stores the player state as a JSON string in a Redis Hash linked to the Room ID."""
-    state = {"status": "online"} | player.model_dump(mode="json", exclude_none=True)
+    state = {"status": "online", "conn_id": conn_id} | player.model_dump(mode="json", exclude_none=True)
     hash_key = f"room:{room_id}:players"
     await redis_client.hset(hash_key, player.player_id, json.dumps(state))
     logger.info(f"Stored player {player.player_id} state in Redis for room {room_id}")
 
-async def set_player_offline(room_id: str, player_id: str):
+async def set_player_offline(room_id: str, player_id: str, conn_id: str):
     """Updates the player state to offline in Redis without removing them from the Room."""
     hash_key = f"room:{room_id}:players"
     
@@ -38,6 +39,11 @@ async def set_player_offline(room_id: str, player_id: str):
             state = json.loads(existing_state_raw)
         except json.JSONDecodeError:
             pass
+
+    # Guard against stale disconnect: only mark offline if the connection ids match.
+    existing_conn_id = state.get("conn_id")
+    if isinstance(existing_conn_id, str) and existing_conn_id != conn_id:
+        return
             
     state["status"] = "offline"
     await redis_client.hset(hash_key, player_id, json.dumps(state))
