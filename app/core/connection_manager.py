@@ -68,21 +68,32 @@ class ConnectionManager:
             del self.active_rooms[room_id]
         return True
 
+    def is_current_connection(self, room_id: str, player_id: str, conn_id: str) -> bool:
+        """Check whether *conn_id* is still the active connection for a player."""
+        room_conns = self.active_rooms.get(room_id)
+        if not room_conns:
+            return False
+        existing = room_conns.get(player_id)
+        if existing is None:
+            return False
+        return existing.get("conn_id") == conn_id
+
     async def broadcast_to_room(self, room_id: str, message: ServerEvent):
         if room_id in self.active_rooms:
             msg_json = message.model_dump_json()
             # Iterate a snapshot so we can safely remove broken connections.
             for player_id, conn_data in list(self.active_rooms[room_id].items()):
                 socket: WebSocket = conn_data["socket"]
+                snapshot_conn_id: str | None = conn_data.get("conn_id")
                 try:
                     await socket.send_text(msg_json)
                 except WebSocketDisconnect:
                     # Expected during fast refresh / React StrictMode / tab close.
                     logger.info("Broadcast prune: %s disconnected from %s", player_id, room_id)
-                    self.disconnect(room_id, player_id, conn_id=None)
+                    self.disconnect(room_id, player_id, conn_id=snapshot_conn_id)
                 except Exception as e:
                     logger.error("Error broadcasting to %s in %s: %r", player_id, room_id, e)
-                    self.disconnect(room_id, player_id, conn_id=None)
+                    self.disconnect(room_id, player_id, conn_id=snapshot_conn_id)
 
     async def send_personal_message(self, message: ServerEvent, websocket: WebSocket):
         try:

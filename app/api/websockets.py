@@ -27,6 +27,8 @@ async def _build_room_payload(room: RoomInfo) -> dict:
     players: list[dict] = []
     for player_id, meta in room_state.items():
         if isinstance(meta, dict):
+            if meta.get("status") == "offline":
+                continue
             players.append(
                 {
                     "player_id": player_id,
@@ -188,9 +190,12 @@ async def _handle_start_game(room: RoomInfo) -> None:
         await manager.broadcast_to_room(room_id, err)
         return
 
-    # Gather player IDs from Redis room state
+    # Gather active player IDs from Redis room state
     room_state = await get_room_state(room_id)
-    player_ids = list(room_state.keys())
+    player_ids = [
+        pid for pid, meta in room_state.items()
+        if not (isinstance(meta, dict) and meta.get("status") == "offline")
+    ]
 
     if len(player_ids) < 4:
         err = ServerEvent(
